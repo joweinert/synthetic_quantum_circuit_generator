@@ -1,302 +1,346 @@
-from typing import Union, Tuple, List, Dict
-import time
+from typing import Protocol, List
 import numpy as np
-import random
 from qiskit import QuantumCircuit
+from qiskit.circuit import CircuitInstruction
 import math
-import traceback
+from utils import bcolors
+from tqdm import tqdm
 
-Gate = Union[int, Tuple[int, int]]   # Define the alias for gate, as it can be a tuple oir an int
+from circuit import Circuit
 
-class GeneradorCircuitsQuantics():
-    
-    def __init__(self, verbose=False):
+
+class ObjectiveFunction(Protocol):
+    name: str
+    requires: set[str]  # feature keys this objective needs
+    initial_loss: float = -1.0  # set to -1.0 to indicate uninitialized
+
+    # should return normalized loss -> divided by initial loss
+    def score(self, cand_circuit: Circuit, target_feats: dict) -> float: ...
+
+    def add_required_features(
+        self, circuit: Circuit, target_feats: dict | None = None
+    ) -> dict: ...
+
+
+class DepthObjectiveFunction:
+
+    name = "depth"
+    requires = {"depth"}
+    initial_loss = -1.0
+
+    def score(self, cand_circuit: Circuit, target_feats: dict) -> float:
+        loss = abs(cand_circuit.depth - target_feats["depth"])
+        if self.initial_loss < 0:
+            self.initial_loss = max(loss, 1e-6)  # to avoid division by zero
+        return loss / self.initial_loss
+
+    def add_required_features(
+        self, circuit: Circuit, target_feats: dict | None = None
+    ) -> dict:
+        if target_feats is None:
+            target_feats = {}
+        if "depth" not in target_feats:
+            target_feats["depth"] = circuit.depth
+        return target_feats
+
+
+# class GatePerSliceObjective:
+#     name = "gps"
+#     requires = {"slice_hist"}  # implement add_required_features to compute target hist
+
+#     def score(self, cand, target):
+#         h_s = slice_hist(cand)
+#         h_t = target["slice_hist"]
+#         # pad to same length
+#         L = max(len(h_s), len(h_t))
+#         hs = np.pad(h_s, (0, L - len(h_s)))
+#         ht = np.pad(h_t, (0, L - len(h_t)))
+#         return float(np.sum(np.abs(hs - ht)))
+
+
+class QuantumCircuitGenerator:
+
+    def __init__(
+        self,
+        op_min: float = 0.2,
+        op_ratio: float = 0.1,  # REDEFINED: ratio to increase/decrease gates_to_reorder, if acceptance rate is too low (< 20%) / high (> 80%) -> descrease/increase gates_to_reorder respectively. 0.1 -> 10% descrease/increase
+        temp_init: float = None,
+        alpha: float = None,
+        delta: float = None,
+        reorder_ratio_init: float = 0.5,  # initial ratio of gates to reorder
+        temp_min: float = 1e-6,
+        verbose: bool = False,
+        seed: int = 0,
+    ):
         self.verbose = verbose
+        self.op_min = op_min
+        self.op_ratio = op_ratio
+        self.temp_init = temp_init
+        self.temp_min = temp_min
+        self.alpha = alpha
+        self.delta = delta
+        self.reorder_ratio_init = reorder_ratio_init
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
 
-    def _get_number_of_qubits(self, probabilities_for_gate: Dict[Gate, float] )-> None:
-        """
-        Returns the numebr of qubits of the circuit, given the probabilities
-        """
-        n_qubits = 0
-        for q in probabilities_for_gate.keys():
-            if type(q) == tuple:
-                n_qubits = max(q[0], n_qubits)
-                n_qubits = max(q[1], n_qubits)
-            else:
-                n_qubits = max(q, n_qubits)
-        
-        n_qubits += 1
+        self.obj_weights = None
+        self.objectives = None
+        self.circuit = None
+        self.target_feats = None
+        self.target_override = None
 
-        return n_qubits
-    
-    def _generate_initial_random_gates(self, probabilities_for_gate: Dict[Gate, float], n_gates: int) -> List[Gate]:
-        """
-        Returns a list of gates based on the probabilities for each gate
-        """
-        if n_gates <= 0:
-            return []
+    def generate_circuits(
+        self,
+        circuit: Circuit,  # a circuit to mimic
+        target_override: dict = None,  # target features to override the ones from the circuit
+        objectives: List[ObjectiveFunction] = [
+            DepthObjectiveFunction()
+        ],  # list of objective function instances to optimize
+        obj_weights: list[float] = None,  # weights for each objective function
+        n=10,  # number of circuits to generate
+        max_iter=np.inf,  # max number of iterations to try per generated circuit
+        min_iter=1000,  # minimum number of iterations to try per generated circuit, i.e used for simulated annealing style stopping criterion
+        wait_iter=6500,  # number of iterations to wait for improvement before stopping
+        seed=None,
+    ):
+        # checks if inputs are valid and stores them as class attributes
 
-        list_gates = list(probabilities_for_gate.keys())
-        index_gates = range(len(list_gates))
-        probabilities = np.array(list(probabilities_for_gate.values()))
+        self._check_inputs(
+            circuit=circuit,
+            target_override=target_override,
+            objectives=objectives,
+            obj_weights=obj_weights,
+            seed=seed,
+        )
+        self.target_feats = self._get_gold_standard()
+        generated_circuits = []
 
-        index_gates = list(np.random.choice(index_gates, size=n_gates, p=probabilities))
-        gates = [list_gates[i] for i in index_gates]
+        self._generate_single_circuit()
 
-        random.shuffle(gates)
-        
-        return list(gates)
+        for _ in tqdm(range(n)):
+            (
+                cand_circuit,
+                best_circuit,
+                iter,
+                last_improved_iter,
+                accepted_cnt,
+                loss_cache,
+                best_loss,
+                end_reason,
+            ) = (
+                None,
+                None,
+                0,
+                0,
+                0,
+                [],
+                float("inf"),
+                "max iter",
+            )
+            n_gates = len(self.circuit.data)
+            gates_to_reorder = int(self.reorder_ratio_init * n_gates)
+            temp = self.temp_init
 
-    def _loss_function(self, gates : List[Gate]):
-        """
-        Returns the loss function from a given gate order
-        """
-        circuit_data = self._get_circuit_data(gates)
+            while (iter - last_improved_iter) < wait_iter and iter <= max_iter:
+                iter += 1
 
-        #depht loss
-        depht = circuit_data["depht"]
-        depht_loss = abs(self._desired_depth - depht)
+                if iter % 500 == 0:
+                    if temp is not None and self.alpha is not None:
+                        temp = max(self.alpha * temp, self.temp_min)
+                    if accepted_cnt / 500 < 0.2:
+                        gates_to_reorder = max(
+                            int(self.op_min * n_gates),
+                            int((1 - self.op_ratio) * gates_to_reorder),
+                        )
+                    elif accepted_cnt / 500 > 0.8:
+                        gates_to_reorder = min(
+                            n_gates, int((1 + self.op_ratio) * gates_to_reorder)
+                        )
+                    accepted_cnt = 0
 
-        #distribution loss
+                cand_circuit = self._create_cand_circuit(best_circuit, gates_to_reorder)
+                loss = self._calc_loss(cand_circuit)
+                loss_cache.append(loss)
 
-        dist_gates_per_slice = circuit_data["histo"]
-        histogram_diferences = {k: dist_gates_per_slice[k] - self.desired_dist_gates_per_slice.get(k, 0) for k in dist_gates_per_slice.keys()}
+                if (
+                    iter == 1
+                    or (loss < best_loss)
+                    or (
+                        temp is not None
+                        and self.rng.random() < math.exp(-abs(loss - best_loss) / temp)
+                    )
+                ):
+                    best_loss, best_circuit, last_improved_iter = (
+                        loss,
+                        cand_circuit,
+                        iter,
+                    )
+                    accepted_cnt += 1
 
-        gates_loss = sum(abs(d) for d in histogram_diferences.values())
-        gates_loss += sum(self.desired_dist_gates_per_slice[k] for k in self.desired_dist_gates_per_slice.keys() if k not in dist_gates_per_slice.keys() )
-
-
-
-        #normailize
-        if self._first_time_loss:
-            self._first_time_loss = False
-            self._initial_loss_depht = depht_loss
-            self._initial_loss_gates = gates_loss
-        
-        self.normalized_depht_loss = depht_loss/self._initial_loss_depht if self._initial_loss_depht else 0
-        self.normalized_gates_loss = gates_loss/self._initial_loss_gates if self._initial_loss_gates else 0
-
-        return (self.normalized_depht_loss + self.normalized_gates_loss)/2
-    
-    def _get_circuit_data(self, gates : List[Gate]):
-
-        last_used = [0 for _ in range(self.number_of_qubits)]
-
-        gates_in_slice = [0 for i in range(len(gates))] # defineix a quina slice es troba el gate
-
-        for i, gate in enumerate(gates):
-            if type(gate) == tuple: # 2-qubit gate
-                q1, q2 = gate
-
-                sl = max(last_used[q1], last_used[q2])
-                last_used[q1] = sl + 1
-                last_used[q2] = sl + 1
-                gates_in_slice[i] = sl + 1       
-
-
-            else: # 1-qubit gate
-                q = gate
-                sl = last_used[q] 
-                last_used[q]  = sl +1
-                gates_in_slice[i] = sl + 1
-                #print(last_used[q])
-
-        #els primers gates es troben en l'slice 1
-
-        depht = max(gates_in_slice)
-
-
-        density_per_slice = [0]*(max(gates_in_slice) +1) # el index es la slice i el valor es el nombre de gates
-        for sl in gates_in_slice:
-            density_per_slice[sl] += 1
-
-        gate_density = [ density_per_slice[sl] for sl in gates_in_slice] # el index es el gate i el value es la densitat de la slice en el que esta
-
-        density_per_slice.pop(0) # ja podem eliminar la redundancia del slice 0 amb 0
-
-
-        
-        histo = {} # per cada density, el nombre de slices
-
-        for n_gates in density_per_slice:
-            histo[n_gates] = 1 + histo.get(n_gates, 0)
-
-
-
-        return {"depht": depht, "histo": histo}
-    
-    def _get_gates_to_reorder(self, current_gates_to_reorder, ratio_percentage, min_gates_to_reorder, max_gates_to_reorder):
-
-        if ratio_percentage < 20:
-            current_gates_to_reorder /= self.ratio_descent_gates_to_reorder#1.5
-        elif ratio_percentage > 80:
-            current_gates_to_reorder *= 1.25
-
-        return int(max(min_gates_to_reorder,min(current_gates_to_reorder, max_gates_to_reorder)))
-      
-    def _reorder_gates(self, gates:List[Gate], n:int) -> List[Gate]:
-        """
-        Returns a new list, reorders n gates from the gates list to a random position
-        """
-        old_indices = random.sample(range(len(gates)), n)
-        new_indices = random.sample(range(len(gates)), n)
-
-        new_gates = ["unset"]*len(gates)
-
-        for new_ind, old_ind in zip(new_indices, old_indices):
-            new_gates[new_ind] = gates[old_ind]
-
-        
-        new_i = 0
-        old_i = 0
-        while new_i < len(new_gates):
-            if old_i in old_indices: # si el index es dels que hem escollit abans
-                old_i += 1
-                continue
-            if new_gates[new_i] == "unset":
-                new_gates[new_i] = gates[old_i]
-                old_i += 1
-            new_i += 1
-        
-        return new_gates
-
-    def _generate_circuit_from_gates(self, gates: List[Gate]) -> QuantumCircuit:
-        """
-        Generates a circuit that has the gates on that order
-        """
-        qc = QuantumCircuit(self.number_of_qubits)
-
-        for g in gates:
-            if type(g) == tuple and len(g) == 2:
-                q1, q2 = g
-                qc.cz(q1, q2)
-            elif type(g) == int:
-                qc.h(g)
-            else:
-                raise TypeError("gate must be either a tuple or an int")
-    
-        return qc
-
-    def generate_circuit(self, data):
-        # temps d'execucio
-        ini_time = time.time()
-
-        # Definicio de parametres
-        number_of_gates         = data["number_of_gates"]
-        self._desired_depth     = data["desired_depth"]
-        probabilities_for_gate  = data["probabilities"]
-        self.number_of_qubits   = self._get_number_of_qubits(probabilities_for_gate)
-
-        temperature             = data["temperature"]
-        alpha                   = data.get("alpha", 1)
-        val                     = data.get("val", 0.01)
-
-        self.ratio_descent_gates_to_reorder = data.get("ratio_descent_gates_to_reorder", 1.5)
-        self.desired_dist_gates_per_slice =   data.get("desired_dist_gates_per_slice")
-        gates_to_reorder_min_percentatge = data.get("gates_to_reorder_min_percentatge", 0.5)
-
-        #Definicio parametres bucle
-        iterations_per_step = 500 
-        max_steps           = 30000
-
-        #Definicio de llistes per a visualitzar les execucions (les que porten v_ nomes son per a visualitzar)
-        losses          = []
-        loss_each_step  = []
-        end_reason = f"MAX ITERATIONS achieved, steps = {max_steps}, iterations_per_step = {iterations_per_step}"
-
-        # set up variables generacio cricuit
-        gates = self._generate_initial_random_gates(probabilities_for_gate, number_of_gates)
-        circuit_original = self._generate_circuit_from_gates(gates)
-        self._first_time_loss = True # per a normalitzar
-        loss  = self._loss_function(gates)
-        gates_to_reorder = int(0.5*len(gates)) # initial value
-        gates_to_reorder_max = int(0.5*len(gates))
-        gates_to_reorder_min = int((gates_to_reorder_min_percentatge/100)*len(gates))
-
-        n = 0
-        m = 0
-        a = 0
-        end_bc_distribution = False
-
-        iteration = 0
-        #bucle
-        try:
-            for step in range(max_steps):
-                iterations_accepted = 0
-                for _ in range(iterations_per_step):
-                    iteration += 1
-                    
-                    #generem el nou circuit
-                    new_gates = self._reorder_gates(gates, gates_to_reorder)
-                    new_loss  = self._loss_function(new_gates) 
-
-                    # comparem els circuits
-                    if temperature:
-                        accept_new_state = new_loss < loss or random.random()< math.exp(-abs(new_loss - loss)/temperature)
-                    else:
-                        accept_new_state = new_loss < loss 
-
-                    # si acceptem el nou estat
-                    if accept_new_state:
-                        gates = new_gates
-                        loss = new_loss
-                        iterations_accepted += 1
-
-
-                    losses.append(loss)
-
-
-                    n += 1
-                    m += loss
-                    a += loss*loss
-
-                    S2 = a - (m*m/n)
-
-                    
-                    if n > 10000:#1500:
-                        coef1 = math.sqrt(S2/(n*n - n))
-                        coef2 = val * m/n
-                        if coef1 < coef2:
-                            end_bc_distribution = True
-                            break
-
-
-                #Han acabat 500 iteracions, calculem nous parametres
-                
-                #actualitzem el nombre de gates to reorder
-                ratio = 100*iterations_accepted/iterations_per_step
-                gates_to_reorder = self._get_gates_to_reorder(gates_to_reorder, ratio, gates_to_reorder_min, gates_to_reorder_max)
-
-                #actualitzem temperatura
-                temperature = temperature*alpha
-
-                #comprovem si hem de parar
                 if loss == 0:
                     end_reason = "LOSS = 0"
-                    break 
-
-
-                if end_bc_distribution:
-                    end_reason = "distribution reached"
                     break
 
+                # simulated annealing style stopping criterion
+                n = len(loss_cache)
+                if self.delta is not None and n > min_iter:
+                    mu = float(np.mean(loss_cache))
+                    if np.std(loss_cache) / np.sqrt(n) < self.delta * mu:
+                        end_reason = f"simulated annealing style stopping criterion met after {iter} iterations"
+                        break
 
-                loss_each_step.append(loss)
+            if end_reason == "max iter" and iter < max_iter:
+                end_reason = f"no improvement for {wait_iter} iterations"
 
+            generated_circuits.append(
+                {
+                    "circuit": best_circuit,
+                    "loss": best_loss,
+                    "found_iter": last_improved_iter,
+                    "total_iter": iter,
+                    "end_reason": end_reason,
+                }
+            )
 
-        #except Exception as e:  # per si hi ha alguna excepcio al bucle
-        #    end_reason = "EXCEPTION"
-        #    print(e)
-        except Exception:
-            traceback.print_exc()
-        #end bucle
-        circuit = self._generate_circuit_from_gates(gates)
-        if self.verbose:
-            print(f"Execution time: {time.time()- ini_time}")
+        return generated_circuits[0] if n == 1 else generated_circuits
 
-        return [circuit_original, circuit], {
-            "exec_time": time.time()- ini_time, 
-            "final_loss": loss, 
-            "end_reason": end_reason, 
-            "final_iteration": iteration
-            }
+    def _create_cand_circuit(
+        self, state: Circuit = None, gates_to_reorder: int = 0
+    ) -> Circuit:
+        if state is None:
+            m = len(self.circuit.data)
+            # we want to smaple m gates with replacement from the original circuit -> only using the qubits involved in the gates
+            # -> preserves empirical qubit dependent 1q/2q node/edge distribution
+            # -> to ensure variation we sample the operation / params in the next step
+            idx = self.rng.integers(0, m, size=m)
+
+            gate_list = []
+            for i in idx:
+                q = self.circuit.data[i].qubits
+
+                if len(q) == 2:
+                    _, operation, clbits = self.circuit.sample_2q_gate(self.rng)
+                elif len(q) == 1:
+                    _, operation, clbits = self.circuit.sample_1q_gate(self.rng)
+                elif len(q) >= 3:
+                    _, operation, clbits = self.circuit.sample_gt2q_gate(self.rng)
+                    print(
+                        bcolors.WARNING
+                        + f"Warning: Sampled {operation.name} gate with >= 3 qubits"
+                        + bcolors.ENDC
+                    )
+                else:
+                    raise ValueError("Gate with no qubits?")
+
+                gate_list.append(CircuitInstruction(operation.copy(), q, clbits))
+
+            state = self.circuit
+
+        else:
+            # reorder gates_to_reorder gates in the current state
+            gate_list = self._reorder_gatelist(
+                list(state.data.copy()), gates_to_reorder
+            )
+
+        qc = self._build_qc_from_gate_list(gate_list, state)
+        return Circuit.from_qiskit(qc)
+
+    def _reorder_gatelist(self, gate_list: list, gates_to_reorder: int) -> list:
+        if gates_to_reorder <= 0 or gates_to_reorder > len(gate_list):
+            print(
+                bcolors.WARNING
+                + "Warning: gates_to_reorder out of bounds"
+                + bcolors.ENDC
+            )
+            return gate_list
+
+        src_idx = self.rng.choice(
+            range(len(gate_list)), size=gates_to_reorder, replace=False
+        )
+        new_idx = self.rng.choice(
+            range(len(gate_list)), size=gates_to_reorder, replace=False
+        )
+        moved = [gate_list[i] for i in src_idx]
+        # self.rng.shuffle(moved)
+        placement = dict(zip(new_idx, moved))
+
+        src_set = set(src_idx)
+        rest_iter = (g for i, g in enumerate(gate_list) if i not in src_set)
+
+        out = []
+        for i in range(len(gate_list)):
+            if i in placement:  # all the move items
+                out.append(placement[i])
+            else:  # original order for non moved
+                out.append(next(rest_iter))
+        return out
+
+    def _build_qc_from_gate_list(
+        self, data: list, src_circuit: Circuit
+    ) -> QuantumCircuit:
+        qc = QuantumCircuit(src_circuit.num_qubits, src_circuit.num_clbits)
+
+        for item in data:
+            # CircuitInstruction instances
+            op, qargs, cargs = item.operation, item.qubits, item.clbits
+            # Map source Bits -> integer positions
+            q_idx = [src_circuit.find_bit(q).index for q in qargs]
+            c_idx = [src_circuit.find_bit(c).index for c in cargs] if cargs else []
+
+            qc.append(op, q_idx, c_idx)
+
+        return qc
+
+    def _check_inputs(self, circuit, target_override, objectives, obj_weights, seed):
+        if not isinstance(circuit, Circuit):
+            raise TypeError("circuit must be an instance of Circuit class.")
+        if objectives is None or len(objectives) == 0:
+            raise ValueError("At least one objective function must be provided.")
+        if obj_weights is None or len(obj_weights) == 0:
+            obj_weights = [1.0 / len(objectives) for _ in objectives]
+        elif len(obj_weights) != len(objectives):
+            raise ValueError("obj_weights must have the same length as objectives.")
+        if target_override is not None and not isinstance(target_override, dict):
+            raise TypeError("target_override must be a dictionary.")
+        else:
+            if target_override is not None:
+                all_required = set()
+                for obj in objectives:
+                    all_required.update(obj.requires)
+                for key in target_override.keys():
+                    if key not in all_required:
+                        print(
+                            bcolors.WARNING
+                            + f"Warning: target_override contains key '{key}' which is not required by any objective and therefore unused for optimization."
+                            + bcolors.ENDC
+                        )
+        if not math.isclose(sum(obj_weights), 1.0):
+            print(
+                f"{bcolors.WARNING}Warning: obj_weights do not sum to 1. Proceeding anyway.{bcolors.ENDC}"
+            )
+
+        self.circuit = circuit
+        self.target_override = target_override
+        self.objectives = objectives
+        self.obj_weights = obj_weights
+        if seed is not None:
+            self.seed = seed
+        self.rng = np.random.default_rng(self.seed)
+
+    def _calc_loss(
+        self,
+        cand_circuit: Circuit,
+    ) -> float:
+        loss = 0.0
+        for obj, weight in zip(self.objectives, self.obj_weights):
+            loss += weight * obj.score(cand_circuit, self.target_feats)
+        return loss
+
+    def _get_gold_standard(self) -> dict:
+        target_feats = {}
+        if self.target_override is not None:
+            target_feats.update(self.target_override)
+        for obj in self.objectives:
+            target_feats.update(obj.add_required_features(self.circuit, target_feats))
+
+        return target_feats

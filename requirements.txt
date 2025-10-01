@@ -1,0 +1,4 @@
+qiskit
+networkx
+mqt.bench
+tqdm
