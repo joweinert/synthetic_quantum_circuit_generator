@@ -1,18 +1,29 @@
-from typing import Protocol, List
+from typing import Protocol, List, runtime_checkable
+from dataclasses import dataclass
 import numpy as np
 from qiskit import QuantumCircuit
 from qiskit.circuit import CircuitInstruction
 import math
-from utils import bcolors
+from utils import bcolors, hist_dict_to_array
 from tqdm import tqdm
+from datetime import datetime
 
 from circuit import Circuit
 
 
+@dataclass
+class ObjectiveBase:
+    initial_loss: float = -1.0  # set to -1.0 to indicate uninitialized
+
+    def reset_initial_loss(self) -> None:
+        self.initial_loss = -1.0
+
+
+@runtime_checkable
 class ObjectiveFunction(Protocol):
     name: str
     requires: set[str]  # feature keys this objective needs
-    initial_loss: float = -1.0  # set to -1.0 to indicate uninitialized
+    initial_loss: float
 
     # should return normalized loss -> divided by initial loss
     def score(self, cand_circuit: Circuit, target_feats: dict) -> float: ...
@@ -22,11 +33,10 @@ class ObjectiveFunction(Protocol):
     ) -> dict: ...
 
 
-class DepthObjectiveFunction:
+class DepthObjectiveFunction(ObjectiveBase):
 
     name = "depth"
     requires = {"depth"}
-    initial_loss = -1.0
 
     def score(self, cand_circuit: Circuit, target_feats: dict) -> float:
         loss = abs(cand_circuit.depth - target_feats["depth"])
@@ -44,18 +54,37 @@ class DepthObjectiveFunction:
         return target_feats
 
 
-# class GatePerSliceObjective:
-#     name = "gps"
-#     requires = {"slice_hist"}  # implement add_required_features to compute target hist
+class GatePerSliceObjective(ObjectiveBase):
+    name = "gps"
+    requires = {
+        "gates_per_slice_distribution"
+    }  # dict[int,int] -> e.g. {1: 5, 2: 10, 3:2} means 5 slices with 1 gate, 10 with 2 gates, 2 with 3 gates
 
-#     def score(self, cand, target):
-#         h_s = slice_hist(cand)
-#         h_t = target["slice_hist"]
-#         # pad to same length
-#         L = max(len(h_s), len(h_t))
-#         hs = np.pad(h_s, (0, L - len(h_s)))
-#         ht = np.pad(h_t, (0, L - len(h_t)))
-#         return float(np.sum(np.abs(hs - ht)))
+    def score(self, cand_circuit: Circuit, target_feats: dict) -> float:
+        cand = cand_circuit.gates_per_slice_distribution
+        target = target_feats["gates_per_slice_distribution"]
+
+        max_bin = max([0, *cand.keys(), *target.keys()])
+        cand_arr = hist_dict_to_array(cand, max_bin)
+        target_arr = hist_dict_to_array(target, max_bin)
+
+        loss = np.abs(cand_arr - target_arr).sum()
+
+        if self.initial_loss < 0:
+            self.initial_loss = max(loss, 1e-6)  # to avoid division by zero
+        return loss / self.initial_loss
+
+    def add_required_features(
+        self, circuit: Circuit, target_feats: dict | None = None
+    ) -> dict:
+        if target_feats is None:
+            target_feats = {}
+        if "gates_per_slice_distribution" not in target_feats:
+            target_feats["gates_per_slice_distribution"] = (
+                circuit.gates_per_slice_distribution
+            )
+
+        return target_feats
 
 
 class QuantumCircuitGenerator:
@@ -94,7 +123,8 @@ class QuantumCircuitGenerator:
         circuit: Circuit,  # a circuit to mimic
         target_override: dict = None,  # target features to override the ones from the circuit
         objectives: List[ObjectiveFunction] = [
-            DepthObjectiveFunction()
+            DepthObjectiveFunction(),
+            GatePerSliceObjective(),
         ],  # list of objective function instances to optimize
         obj_weights: list[float] = None,  # weights for each objective function
         n=10,  # number of circuits to generate
@@ -103,8 +133,8 @@ class QuantumCircuitGenerator:
         wait_iter=6500,  # number of iterations to wait for improvement before stopping
         seed=None,
     ):
-        # checks if inputs are valid and stores them as class attributes
 
+        # checks if inputs are valid and stores them as class attributes
         self._check_inputs(
             circuit=circuit,
             target_override=target_override,
@@ -114,8 +144,6 @@ class QuantumCircuitGenerator:
         )
         self.target_feats = self._get_gold_standard()
         generated_circuits = []
-
-        self._generate_single_circuit()
 
         for _ in tqdm(range(n)):
             (
@@ -140,11 +168,17 @@ class QuantumCircuitGenerator:
             n_gates = len(self.circuit.data)
             gates_to_reorder = int(self.reorder_ratio_init * n_gates)
             temp = self.temp_init
+            for obj in self.objectives:
+                obj.reset_initial_loss()
 
             while (iter - last_improved_iter) < wait_iter and iter <= max_iter:
                 iter += 1
 
                 if iter % 500 == 0:
+                    if self.verbose:
+                        print(
+                            f"Iter {iter}: Best loss so far: {best_loss}, acceptance rate {accepted_cnt/500} (sliding window 500), gates to reorder: {gates_to_reorder}, temp: {temp}"
+                        )
                     if temp is not None and self.alpha is not None:
                         temp = max(self.alpha * temp, self.temp_min)
                     if accepted_cnt / 500 < 0.2:
@@ -182,10 +216,9 @@ class QuantumCircuitGenerator:
                     break
 
                 # simulated annealing style stopping criterion
-                n = len(loss_cache)
-                if self.delta is not None and n > min_iter:
+                if self.delta is not None and iter > min_iter:
                     mu = float(np.mean(loss_cache))
-                    if np.std(loss_cache) / np.sqrt(n) < self.delta * mu:
+                    if np.std(loss_cache) / np.sqrt(len(loss_cache)) < self.delta * mu:
                         end_reason = f"simulated annealing style stopping criterion met after {iter} iterations"
                         break
 
@@ -296,6 +329,13 @@ class QuantumCircuitGenerator:
             raise TypeError("circuit must be an instance of Circuit class.")
         if objectives is None or len(objectives) == 0:
             raise ValueError("At least one objective function must be provided.")
+        for obj in objectives:
+            if not (
+                isinstance(obj, ObjectiveFunction) and isinstance(obj, ObjectiveBase)
+            ):
+                raise TypeError(
+                    "All objectives must adhere to the ObjectiveFunction interface and inherit ObjectiveBase."
+                )
         if obj_weights is None or len(obj_weights) == 0:
             obj_weights = [1.0 / len(objectives) for _ in objectives]
         elif len(obj_weights) != len(objectives):

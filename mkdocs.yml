@@ -1,0 +1,45 @@
+site_name: "Synthetic Quantum Circuit Generator Documentation"
+
+theme:
+  name: "material"
+
+plugins:
+- search
+- mkdocstrings:
+    enabled: !ENV [ENABLE_MKDOCSTRINGS, true]
+    #custom_templates: templates
+    default_handler: python
+    locale: en
+    handlers:
+      python:
+        options:
+          show_source: true
+          show_root_heading: true
+
+nav:
+  - Home: index.md
+  - Circuit Wrapper: 
+      - Constructors: circuit.md
+      - Size related features: size.md
+      - IG features: interaction_graph.md
+      - GDG features: gate_dependency_graph.md
+
+# markdown_extensions:
+#   - pymdownx.arithmatex:
+#       generic: true
+
+# extra_javascript:
+#   - javascripts/mathjax.js
+#   - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
+
+markdown_extensions:
+  - pymdownx.arithmatex:
+      generic: true
+
+extra_javascript:
+  - javascripts/katex.js
+  - https://unpkg.com/katex@0/dist/katex.min.js
+  - https://unpkg.com/katex@0/dist/contrib/auto-render.min.js
+
+extra_css:
+  - https://unpkg.com/katex@0/dist/katex.min.css
